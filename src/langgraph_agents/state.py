@@ -9,8 +9,14 @@ class ExtractionState(TypedDict):
     raw_text: str
     pdf_path: Optional[str]
     
+    # 文档块信息（新增）
+    document_blocks: List[Dict[str, Any]]          # 文档块列表
+    
     # 实体抽取结果
     entities: List[Dict[str, Any]]
+    
+    # 块级实体映射（新增）
+    block_entities: Dict[str, List[Dict[str, Any]]]  # 块ID -> 实体列表
     
     # 指代消解后的实体
     resolved_entities: List[Dict[str, Any]]
@@ -20,6 +26,9 @@ class ExtractionState(TypedDict):
     
     # 关系抽取结果
     relations: List[Dict[str, Any]]
+    
+    # 归一化后的关系（新增）
+    normalized_relations: List[Dict[str, Any]]
     
     # 质量检查
     quality_report: Optional[QualityReport]
@@ -51,10 +60,13 @@ def create_initial_state(text: str, pdf_path: Optional[str] = None) -> Extractio
     return ExtractionState(
         raw_text=text,
         pdf_path=pdf_path,
+        document_blocks=[],
         entities=[],
+        block_entities={},
         resolved_entities=[],
         normalized_entities=[],
         relations=[],
+        normalized_relations=[],
         quality_report=None,
         current_stage="initial",
         backtrack_needed=False,

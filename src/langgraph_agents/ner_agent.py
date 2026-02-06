@@ -96,7 +96,7 @@ class NERAgent(BaseAgent):
     
     def process(self, state: Dict[str, Any]) -> Dict[str, Any]:
         """
-        执行实体识别
+        执行实体识别（块级处理）
         
         Args:
             state: 当前状态
@@ -104,7 +104,66 @@ class NERAgent(BaseAgent):
         Returns:
             更新后的状态
         """
-        logger.info(f"[{self.name}] 开始执行实体识别...")
+        logger.info(f"[{self.name}] 开始执行块级实体识别...")
+        
+        # 获取文档块
+        document_blocks = state.get("document_blocks", [])
+        
+        if not document_blocks:
+            # 如果没有文档块，对全文执行NER（兼容旧逻辑）
+            return self._process_full_text(state)
+        
+        # 块级处理
+        all_entities = []
+        block_entities = {}  # block_id -> 实体列表
+        
+        for block in document_blocks:
+            block_id = block.get("block_id", "")
+            block_type = block.get("block_type", "")
+            block_content = block.get("content", "")
+            
+            if not block_content:
+                continue
+            
+            logger.debug(f"[{self.name}] 处理块 {block_id} ({block_type})")
+            
+            # 为当前块执行NER
+            block_result = self._process_block(block)
+            
+            # 添加块级信息
+            for entity in block_result:
+                entity["block_id"] = block_id
+                entity["block_type"] = block_type
+            
+            block_entities[block_id] = block_result
+            all_entities.extend(block_result)
+        
+        # 为所有实体分配唯一ID
+        all_entities = self._assign_entity_ids(all_entities)
+        
+        state["entities"] = all_entities
+        state["block_entities"] = block_entities
+        state["current_stage"] = "ner_completed"
+        
+        logger.info(
+            f"[{self.name}] 块级实体识别完成，"
+            f"共处理 {len(document_blocks)} 个块，"
+            f"识别到 {len(all_entities)} 个实体"
+        )
+        
+        return state
+    
+    def _process_full_text(self, state: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        对全文执行实体识别（兼容旧逻辑）
+        
+        Args:
+            state: 当前状态
+            
+        Returns:
+            更新后的状态
+        """
+        logger.info(f"[{self.name}] 对全文执行实体识别...")
         
         # 构建 prompt 并调用 LLM
         prompt = self.build_prompt(state)
@@ -115,10 +174,14 @@ class NERAgent(BaseAgent):
             # 验证和清理实体
             valid_entities = self._validate_entities(entities, state["raw_text"])
             
+            # 过滤代词
+            valid_entities = self._filter_pronouns(valid_entities)
+            
             # 为实体生成唯一 ID
             valid_entities = self._assign_entity_ids(valid_entities)
             
             state["entities"] = valid_entities
+            state["block_entities"] = {}
             state["current_stage"] = "ner_completed"
             logger.info(f"[{self.name}] 识别到 {len(valid_entities)} 个实体")
             
@@ -128,6 +191,125 @@ class NERAgent(BaseAgent):
             raise
         
         return state
+    
+    def _process_block(self, block: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """
+        处理单个文档块的实体识别
+        
+        Args:
+            block: 文档块字典
+            
+        Returns:
+            该块的实体列表
+        """
+        block_content = block.get("content", "")
+        block_type = block.get("block_type", "")
+        block_id = block.get("block_id", "")
+        
+        # 为当前块构建 prompt
+        prompt = self._build_block_prompt(block_content, block_type)
+        
+        try:
+            response = self.invoke_llm(prompt)
+            entities = self._parse_response(response)
+            
+            # 验证和清理实体
+            valid_entities = self._validate_entities(entities, block_content)
+            
+            # 过滤代词（约束：不识别代词）
+            valid_entities = self._filter_pronouns(valid_entities)
+            
+            logger.debug(f"块 {block_id} 识别到 {len(valid_entities)} 个实体")
+            
+            return valid_entities
+            
+        except Exception as e:
+            logger.error(f"块 {block_id} 实体识别失败: {e}")
+            return []
+    
+    def _build_block_prompt(self, block_content: str, block_type: str) -> str:
+        """
+        为单个块构建实体识别提示词
+        
+        Args:
+            block_content: 块内容
+            block_type: 块类型
+            
+        Returns:
+            提示词
+        """
+        prompt = f"""你是一个专业的法律文书实体识别专家。请从以下文档块中识别所有相关实体。
+
+文档块类型: {block_type}
+
+支持的实体类型：
+{self._get_entity_type_descriptions()}
+
+文档块内容：
+{block_content}
+
+请识别所有实体，以 JSON 格式输出，格式如下：
+{{
+    "entities": [
+        {{
+            "type": "实体类型",
+            "text": "实体在原文中的表述",
+            "start_pos": 起始位置（数字），
+            "end_pos": 结束位置（数字），
+            "attributes": {{
+                "具体属性": "属性值"
+            }}
+        }}
+    ]
+}}
+
+注意：
+1. 实体类型必须从支持的类型中选择
+2. 提取实体在原文中的准确位置（start_pos 和 end_pos）
+3. 根据实体类型填写相应的 attributes 字段
+4. 保持原文表述的准确性
+5. **不要识别代词**（如"他"、"她"、"该被告"、"其"等）
+6. 只输出 JSON，不要包含其他解释文本
+
+开始识别："""
+        return prompt
+    
+    def _filter_pronouns(self, entities: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        过滤代词实体
+        
+        Args:
+            entities: 实体列表
+            
+        Returns:
+            过滤后的实体列表
+        """
+        # 常见中文代词
+        pronouns = {
+            "他", "她", "它", "它们", "他们", "她们", "它们们",
+            "其", "该", "此", "本", "上述", "该被告", "该原告",
+            "原告", "被告"  # 这些可能在语境中作为代词使用
+        }
+        
+        filtered_entities = []
+        
+        for entity in entities:
+            entity_text = entity.get("text", "").strip()
+            
+            # 检查是否为代词
+            is_pronoun = entity_text in pronouns
+            
+            if is_pronoun:
+                logger.debug(f"过滤代词实体: {entity_text}")
+                continue
+            
+            filtered_entities.append(entity)
+        
+        filtered_count = len(entities) - len(filtered_entities)
+        if filtered_count > 0:
+            logger.info(f"过滤了 {filtered_count} 个代词实体")
+        
+        return filtered_entities
     
     def _parse_response(self, response: str) -> List[Dict[str, Any]]:
         """解析 LLM 响应"""

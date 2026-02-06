@@ -98,7 +98,7 @@ class RelationAgent(BaseAgent):
     
     def process(self, state: Dict[str, Any]) -> Dict[str, Any]:
         """
-        执行关系抽取
+        执行关系抽取（块级循环抽取）
         
         Args:
             state: 当前状态
@@ -106,12 +106,67 @@ class RelationAgent(BaseAgent):
         Returns:
             更新后的状态
         """
-        logger.info(f"[{self.name}] 开始执行关系抽取...")
+        logger.info(f"[{self.name}] 开始执行块级循环关系抽取...")
         
         if not state.get("normalized_entities"):
             logger.warning(f"[{self.name}] 没有实体，无法抽取关系")
             state["relations"] = []
             return state
+        
+        # 获取文档块
+        document_blocks = state.get("document_blocks", [])
+        
+        if not document_blocks:
+            # 如果没有文档块，对全文执行关系抽取（兼容旧逻辑）
+            return self._process_full_text(state)
+        
+        # 块级循环抽取
+        all_relations = []
+        
+        for block in document_blocks:
+            block_id = block.get("block_id", "")
+            block_type = block.get("block_type", "")
+            block_content = block.get("content", "")
+            
+            if not block_content:
+                continue
+            
+            logger.debug(f"[{self.name}] 处理块 {block_id} ({block_type})")
+            
+            # 为当前块抽取关系
+            block_relations = self._process_block(block, state)
+            
+            # 添加块级信息
+            for relation in block_relations:
+                relation["block_id"] = block_id
+            
+            all_relations.extend(block_relations)
+        
+        # 去重关系
+        all_relations = self._deduplicate_relations(all_relations)
+        
+        state["relations"] = all_relations
+        state["current_stage"] = "relation_completed"
+        
+        logger.info(
+            f"[{self.name}] 块级关系抽取完成，"
+            f"共处理 {len(document_blocks)} 个块，"
+            f"抽取到 {len(all_relations)} 个关系"
+        )
+        
+        return state
+    
+    def _process_full_text(self, state: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        对全文执行关系抽取（兼容旧逻辑）
+        
+        Args:
+            state: 当前状态
+            
+        Returns:
+            更新后的状态
+        """
+        logger.info(f"[{self.name}] 对全文执行关系抽取...")
         
         # 构建 prompt 并调用 LLM
         prompt = self.build_prompt(state)
@@ -130,6 +185,162 @@ class RelationAgent(BaseAgent):
             raise
         
         return state
+    
+    def _process_block(self, block: Dict[str, Any], state: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """
+        处理单个文档块的关系抽取
+        
+        Args:
+            block: 文档块字典
+            state: 当前状态
+            
+        Returns:
+            该块的关系列表
+        """
+        block_content = block.get("content", "")
+        block_type = block.get("block_type", "")
+        block_id = block.get("block_id", "")
+        
+        # 获取该块的实体
+        block_entities = state.get("block_entities", {}).get(block_id, [])
+        all_entities = state.get("normalized_entities", [])
+        
+        if not block_entities:
+            logger.debug(f"块 {block_id} 没有实体，跳过")
+            return []
+        
+        # 为当前块构建 prompt
+        prompt = self._build_block_prompt(
+            block_content, 
+            block_entities, 
+            all_entities,
+            block_type
+        )
+        
+        try:
+            response = self.invoke_llm(prompt)
+            relations = self._parse_and_validate(response, all_entities)
+            
+            logger.debug(f"块 {block_id} 抽取到 {len(relations)} 个关系")
+            
+            return relations
+            
+        except Exception as e:
+            logger.error(f"块 {block_id} 关系抽取失败: {e}")
+            return []
+    
+    def _build_block_prompt(
+        self, 
+        block_content: str, 
+        block_entities: List[Dict[str, Any]],
+        all_entities: List[Dict[str, Any]],
+        block_type: str
+    ) -> str:
+        """
+        为单个块构建关系抽取提示词
+        
+        Args:
+            block_content: 块内容
+            block_entities: 该块的实体列表
+            all_entities: 所有标准化实体列表
+            block_type: 块类型
+            
+        Returns:
+            提示词
+        """
+        # 构建块实体列表
+        block_entity_list = "\n".join([
+            f"- {e.get('entity_id', '')}: {e.get('entity_type', '')} - {e.get('canonical_name', '')}"
+            for e in block_entities
+        ])
+        
+        # 构建全局实体列表（用于跨块引用）
+        all_entity_list = "\n".join([
+            f"- {e.get('entity_id', '')}: {e.get('entity_type', '')} - {e.get('canonical_name', '')}"
+            for e in all_entities[:20]  # 限制数量避免prompt过长
+        ])
+        
+        # 构建关系类型描述
+        relation_desc = "\n".join([
+            f"- {rtype}: {description}"
+            for rtype, description in self.relation_types.items()
+        ])
+        
+        prompt = f"""你是一个专业的法律关系抽取专家。请从文档块中识别实体之间的关系。
+
+文档块类型: {block_type}
+
+当前块的实体列表：
+{block_entity_list}
+
+全局实体列表（前20个）：
+{all_entity_list}
+
+支持的关系类型：
+{relation_desc}
+
+文档块内容：
+{block_content}
+
+任务：
+1. 识别实体之间的语义关系
+2. 确定关系类型（从支持的关系类型中选择）
+3. 标记关系证据（在原文中的位置或句子）
+
+输出格式（JSON）：
+{{
+    "relations": [
+        {{
+            "subject": "主语实体ID或原始文本",
+            "predicate": "关系类型",
+            "object": "宾语实体ID或原始文本",
+            "confidence": "关系置信度（0-1）",
+            "evidence": "支持该关系的原文片段"
+        }}
+    ]
+}}
+
+重要约束：
+1. **如果实体在全局实体列表中存在，必须使用实体ID**（如 "entity_001"）
+2. **如果实体是代词或未识别的实体，必须保留原始文本**（如 "该被告"、"其"）
+3. predicate 必须是支持的关系类型
+4. confidence 范围为 0-1
+5. 只抽取明确表达的关系，不要猜测
+6. 只输出 JSON，不要包含其他解释文本
+
+开始抽取："""
+        return prompt
+    
+    def _deduplicate_relations(self, relations: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        去重关系
+        
+        Args:
+            relations: 关系列表
+            
+        Returns:
+            去重后的关系列表
+        """
+        seen = set()
+        unique_relations = []
+        
+        for relation in relations:
+            # 创建唯一键
+            key = (
+                relation.get("subject", ""),
+                relation.get("predicate", ""),
+                relation.get("object", "")
+            )
+            
+            if key not in seen:
+                seen.add(key)
+                unique_relations.append(relation)
+            else:
+                logger.debug(f"去重关系: {key}")
+        
+        logger.info(f"去重前: {len(relations)}, 去重后: {len(unique_relations)}")
+        
+        return unique_relations
     
     def _parse_and_validate(self, response: str, entities: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """

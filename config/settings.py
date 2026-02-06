@@ -39,6 +39,30 @@ class Settings(BaseSettings):
     # 最大回溯次数
     max_backtrack_attempts: int = 1
     
+    # === 7步新架构配置 ===
+    
+    # 文档结构解析配置
+    document_parser_enabled: bool = True  # 是否启用文档结构解析
+    document_parser_min_block_length: int = 50  # 最小块长度
+    document_parser_merge_short_blocks: bool = True  # 是否合并短块
+    
+    # 实体标准化配置
+    entity_normalization_enabled: bool = True  # 是否启用规则实体标准化
+    entity_similarity_threshold: float = 0.6  # 实体相似度阈值
+    entity_min_cluster_size: int = 1  # 最小实体簇大小
+    
+    # 关系归一化配置
+    relation_normalization_enabled: bool = True  # 是否启用关系归一化
+    relation_validation_strict: bool = False  # 是否严格Schema验证
+    
+    # 指代消解配置
+    coref_max_hops: int = 3  # 最大推理跳数
+    coref_similarity_threshold: float = 0.5  # 指代消解相似度阈值
+    
+    # 块级处理配置
+    block_parallel_processing: bool = False  # 是否并行处理块（预留）
+    block_size_limit: int = 5000  # 单块最大字符数
+    
     class Config:
         env_file = ".env"
         case_sensitive = False

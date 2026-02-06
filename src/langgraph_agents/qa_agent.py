@@ -16,26 +16,31 @@ class QualityCheckAgent(BaseAgent):
     
     def build_prompt(self, context: Dict[str, Any]) -> str:
         """
-        构建质量检查提示词
+        构建质量检查提示词（适配7步流水线）
         
         Args:
-            context: 包含 raw_text, normalized_entities, relations 的上下文
+            context: 包含 raw_text, normalized_entities, normalized_relations, document_blocks 等的上下文
             
         Returns:
             提示词
         """
         text = context.get("raw_text", "")
         entities = context.get("normalized_entities", [])
-        relations = context.get("relations", [])
+        relations = context.get("normalized_relations", [])
+        document_blocks = context.get("document_blocks", [])
         
         # 构建摘要
         entity_summary = self._create_entity_summary(entities)
         relation_summary = self._create_relation_summary(relations)
+        block_summary = self._create_block_summary(document_blocks)
         
         prompt = f"""你是一个知识图谱质量检查专家。请评估以下抽取结果的质量。
 
 原文摘要：
 {text[:1000]}...
+
+文档块结构：
+{block_summary}
 
 抽取结果摘要：
 {entity_summary}
@@ -43,11 +48,14 @@ class QualityCheckAgent(BaseAgent):
 {relation_summary}
 
 检查维度：
-1. 实体完整性：是否遗漏重要实体
-2. 实体准确性：实体类型、属性是否正确
-3. 关系合理性：关系是否符合法律逻辑
-4. 一致性：实体和关系是否自洽
-5. 置信度：低置信度的结果是否需要改进
+1. 文档结构解析：文档块划分是否合理、完整
+2. 实体完整性：是否遗漏重要实体
+3. 实体准确性：实体类型、标准化结果是否正确
+4. 关系合理性：关系是否符合法律逻辑
+5. 指代消解质量：代词引用是否正确消解
+6. Schema验证：关系是否符合预定义Schema
+7. 一致性：实体和关系是否自洽
+8. 置信度：低置信度的结果是否需要改进
 
 输出格式（JSON）：
 {{
@@ -62,17 +70,34 @@ class QualityCheckAgent(BaseAgent):
         "建议1：具体改进措施",
         "建议2：具体改进措施"
     ],
-    "backtrack_stage": "建议回溯的阶段（ner/corf/normalization/relation）"
+    "backtrack_stage": "建议回溯的阶段（document_parser/ner/normalization/relation/relation_norm/coref）"
 }}
 
 注意：
 1. quality_score 范围为 0-1
 2. 如果 quality_score < 0.8，建议回溯
 3. backtrack_stage 只选择一个最需要回溯的阶段
-4. 只输出 JSON
+4. 回溯阶段可选：document_parser, ner, normalization, relation, relation_norm, coref
+5. 只输出 JSON
 
 开始评估："""
         return prompt
+    
+    def _create_block_summary(self, document_blocks: List[Dict[str, Any]]) -> str:
+        """创建文档块摘要"""
+        if not document_blocks:
+            return "未识别到文档块"
+        
+        summary = ["文档块列表："]
+        for block in document_blocks:
+            block_id = block.get("block_id", "")
+            block_type = block.get("block_type", "")
+            title = block.get("title", "")
+            content_preview = block.get("content", "")[:50]
+            
+            summary.append(f"  - {block_id} [{block_type}] {title}: {content_preview}...")
+        
+        return "\n".join(summary)
     
     def _create_entity_summary(self, entities: List[Dict[str, Any]]) -> str:
         """创建实体摘要"""
@@ -95,13 +120,29 @@ class QualityCheckAgent(BaseAgent):
         return "\n".join(summary)
     
     def _create_relation_summary(self, relations: List[Dict[str, Any]]) -> str:
-        """创建关系摘要"""
+        """创建关系摘要（适配归一化关系）"""
         if not relations:
             return "未识别到关系"
         
         summary = ["关系列表："]
+        
+        # 统计通过/未通过验证的关系
+        validated_count = sum(1 for r in relations if r.get("validation_passed", False))
+        need_coref_count = sum(1 for r in relations if r.get("need_coref", False))
+        
+        summary.append(f"  总计: {len(relations)} 个关系")
+        summary.append(f"  通过Schema验证: {validated_count} 个")
+        summary.append(f"  需要指代消解: {need_coref_count} 个")
+        summary.append("\n前10个关系：")
+        
         for rel in relations[:10]:  # 最多显示10个
-            summary.append(f"  - {rel['subject']} -[{rel['predicate']}]-> {rel['object']} (置信度: {rel['confidence']})")
+            subject = rel.get("subject_entity_id", rel.get("subject", ""))
+            predicate = rel.get("predicate", "")
+            object_id = rel.get("object_entity_id", rel.get("object", ""))
+            confidence = rel.get("confidence", 0.0)
+            validation = "✓" if rel.get("validation_passed", False) else "✗"
+            
+            summary.append(f"  - {subject} -[{predicate}]-> {object_id} (置信度: {confidence:.2f}) {validation}")
         
         if len(relations) > 10:
             summary.append(f"  ... 还有 {len(relations) - 10} 个关系")
@@ -110,7 +151,7 @@ class QualityCheckAgent(BaseAgent):
     
     def process(self, state: Dict[str, Any]) -> Dict[str, Any]:
         """
-        执行质量检查
+        执行质量检查（适配7步流水线）
         
         Args:
             state: 当前状态
@@ -154,7 +195,7 @@ class QualityCheckAgent(BaseAgent):
             state["quality_report"] = {
                 "quality_score": 0.5,
                 "entity_count": len(state.get("normalized_entities", [])),
-                "relation_count": len(state.get("relations", [])),
+                "relation_count": len(state.get("normalized_relations", [])),
                 "issues": ["质量检查失败"],
                 "recommendations": [],
             }
