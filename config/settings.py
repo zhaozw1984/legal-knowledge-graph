@@ -12,7 +12,7 @@ class Settings(BaseSettings):
     """应用配置"""
     
     # DeepSeek API 配置
-    dashscope_api_key: str = os.getenv("DASHSCOPE_API_KEY", "sk-590b0d025bad4f12a207f142fcdf49ed")
+    dashscope_api_key: str = os.getenv("DASHSCOPE_API_KEY")
     llm_model: str = os.getenv("LLM_MODEL", "deepseek-v3.2")
     llm_temperature: float = float(os.getenv("LLM_TEMPERATURE", "0.7"))
     llm_max_tokens: int = int(os.getenv("LLM_MAX_TOKENS", "4000"))
