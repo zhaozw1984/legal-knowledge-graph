@@ -62,3 +62,6 @@ output/logs/
 .pytest_cache/
 .coverage
 htmlcov/
+
+# CodeBuddy
+.codebuddy/
